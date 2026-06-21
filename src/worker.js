@@ -129,14 +129,12 @@ async function proxyAnthropic(request, env, upstreamPath) {
 }
 
 async function openAIChatCompletions(request, env, body) {
-  const unsupported = unsupportedToolRequest(body);
-  if (unsupported) return unsupported;
-
   const model = body.model || env.DEFAULT_MODEL || DEFAULT_MODEL;
   const id = `chatcmpl_${randomId()}`;
   const created = nowSeconds();
+  const message = body.message || messagesToText(body.messages) || inputToText(body.input) || body.prompt || "";
   const payload = {
-    message: body.message || messagesToText(body.messages) || inputToText(body.input) || body.prompt || "",
+    message: withOpenAIToolContext(body, message),
     model,
     effort: reasoningEffort(body),
   };
@@ -164,14 +162,11 @@ async function openAIChatCompletions(request, env, body) {
 }
 
 async function openAIResponses(request, env, body) {
-  const unsupported = unsupportedToolRequest(body);
-  if (unsupported) return unsupported;
-
   const model = body.model || env.DEFAULT_MODEL || DEFAULT_MODEL;
   const id = `resp_${randomId()}`;
   const created = nowSeconds();
   const input = inputToText(body.input) || messagesToText(body.messages) || body.prompt || "";
-  const payload = { message: input, model, effort: reasoningEffort(body) };
+  const payload = { message: withOpenAIToolContext(body, input), model, effort: reasoningEffort(body) };
 
   if (body.stream) {
     const upstream = await callUnlimitedStream(request, env, "/api/chat", payload);
@@ -198,20 +193,17 @@ async function openAIResponses(request, env, body) {
   });
 }
 
-function unsupportedToolRequest(body) {
-  const hasTools = Array.isArray(body.tools) && body.tools.length > 0;
-  const wantsToolChoice = body.tool_choice && body.tool_choice !== "none";
-  const hasToolMessages = Array.isArray(body.messages) && body.messages.some((message) => {
-    return message.role === "tool" || message.function_call || Array.isArray(message.tool_calls);
-  });
-
-  if (!hasTools && !wantsToolChoice && !hasToolMessages) return null;
-
-  return errorResponse(
-    501,
-    "tool_calls_not_supported",
-    "unlimited.surf /api/chat streams text deltas and does not expose structured OpenAI tool_calls. Use this Worker for NewAPI chat, not agent command execution."
-  );
+function withOpenAIToolContext(body, message) {
+  const parts = [];
+  if (Array.isArray(body.tools) && body.tools.length) {
+    parts.push(`available OpenAI tools from client: ${JSON.stringify(body.tools)}`);
+    parts.push("The upstream chat endpoint cannot emit structured OpenAI tool_calls. If a tool is needed, describe the intended tool call and arguments in text.");
+  }
+  if (body.tool_choice && body.tool_choice !== "none") {
+    parts.push(`requested tool_choice: ${JSON.stringify(body.tool_choice)}`);
+  }
+  parts.push(message);
+  return parts.filter(Boolean).join("\n\n");
 }
 
 async function proxyJsonCapability(request, env, path, body) {
