@@ -1,5 +1,5 @@
 {
-  "name": "unlimited-transfer-api-worker",
+  "name": "unlimited-openai-worker",
   "version": "1.0.0",
   "private": true,
   "type": "module",
