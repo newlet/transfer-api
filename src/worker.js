@@ -1,6 +1,7 @@
 const DEFAULT_UPSTREAM_BASE_URL = "https://unlimited.surf";
 const DEFAULT_OPENAI_MODEL = "gateway-gpt-5-5";
 const DEFAULT_CLAUDE_MODEL = "claude-opus-4-7-20260101";
+const TOOL_CAPABLE_ROUTES = new Set(["/v1/chat/completions", "/v1/responses"]);
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -82,11 +83,15 @@ async function handleOpenAI(request, env, path) {
 
   if (path === "/v1/chat/completions" && request.method === "POST") {
     const body = await readJson(request);
+    const toolUpstream = maybeProxyToolCapableOpenAI(request, env, path, body);
+    if (toolUpstream) return toolUpstream;
     return openAIChatCompletions(request, env, body);
   }
 
   if (path === "/v1/responses" && request.method === "POST") {
     const body = await readJson(request);
+    const toolUpstream = maybeProxyToolCapableOpenAI(request, env, path, body);
+    if (toolUpstream) return toolUpstream;
     return openAIResponses(request, env, body);
   }
 
@@ -113,6 +118,61 @@ async function handleOpenAI(request, env, path) {
   }
 
   return errorResponse(404, "not_found", `Unsupported OpenAI-compatible route ${path}`);
+}
+
+function maybeProxyToolCapableOpenAI(request, env, path, body) {
+  if (!TOOL_CAPABLE_ROUTES.has(path) || !needsToolCapableUpstream(path, body)) return null;
+
+  const base = openAICompatBase(env);
+  if (!base) {
+    return errorResponse(
+      501,
+      "tool_calls_not_supported",
+      "This request needs structured tool calling, but unlimited.surf /api/chat only supports text chat through this Worker. Set OPENAI_COMPAT_BASE_URL and OPENAI_COMPAT_API_KEY to a real OpenAI-compatible tool-calling upstream."
+    );
+  }
+
+  return proxyOpenAICompat(request, env, path, body, base);
+}
+
+function needsToolCapableUpstream(path, body) {
+  if (path === "/v1/responses") return true;
+  if (Array.isArray(body.tools) && body.tools.length) return true;
+  if (body.tool_choice && body.tool_choice !== "none") return true;
+  if (Array.isArray(body.messages)) {
+    return body.messages.some((message) => Array.isArray(message.tool_calls) || message.role === "tool" || message.function_call);
+  }
+  return false;
+}
+
+async function proxyOpenAICompat(request, env, path, body, base) {
+  const upstreamUrl = new URL(path, base);
+  const headers = new Headers();
+  headers.set("Content-Type", "application/json");
+
+  const key = env.OPENAI_COMPAT_API_KEY || env.TOOL_UPSTREAM_API_KEY || "";
+  if (key) headers.set("Authorization", `Bearer ${key}`);
+
+  const organization = request.headers.get("openai-organization");
+  if (organization) headers.set("OpenAI-Organization", organization);
+
+  const project = request.headers.get("openai-project");
+  if (project) headers.set("OpenAI-Project", project);
+
+  const beta = request.headers.get("openai-beta");
+  if (beta) headers.set("OpenAI-Beta", beta);
+
+  const response = await fetch(upstreamUrl, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body),
+  });
+
+  return addCors(new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: filterProxyResponseHeaders(response.headers),
+  }));
 }
 
 async function openAIDirectCapability(request, env, body, route) {
@@ -798,6 +858,15 @@ function addCors(response) {
   return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
 }
 
+function filterProxyResponseHeaders(source) {
+  const headers = new Headers();
+  for (const name of ["content-type", "cache-control", "request-id", "x-request-id"]) {
+    const value = source.get(name);
+    if (value) headers.set(name, value);
+  }
+  return headers;
+}
+
 async function readJson(request) {
   if (!request.body) return {};
   const text = await request.text();
@@ -875,6 +944,11 @@ function constantTimeEqual(actual, expected) {
 
 function upstreamBase(env) {
   return stripTrailingSlash(env.UPSTREAM_BASE_URL || DEFAULT_UPSTREAM_BASE_URL) + "/";
+}
+
+function openAICompatBase(env) {
+  const value = env.OPENAI_COMPAT_BASE_URL || env.TOOL_UPSTREAM_BASE_URL || "";
+  return value ? stripTrailingSlash(value) + "/" : "";
 }
 
 function normalizePath(path) {
