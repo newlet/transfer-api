@@ -18,3 +18,7 @@ compatibility_date = "2025-11-21"
 UPSTREAM_BASE_URL = "https://unlimited.surf"
 DEFAULT_MODEL = "gateway-gpt-5-5"
 DEFAULT_CLAUDE_MODEL = "claude-opus-4-7-20260101"
+
+# Optional: set this to a real OpenAI-compatible upstream when Codex/agents need
+# structured tool calls. Store OPENAI_COMPAT_API_KEY as a secret.
+# OPENAI_COMPAT_BASE_URL = "https://api.openai.com/v1"
