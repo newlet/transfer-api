@@ -1,11 +1,9 @@
 const DEFAULT_UPSTREAM_BASE_URL = "https://unlimited.surf";
-const DEFAULT_OPENAI_MODEL = "gateway-gpt-5-5";
-const DEFAULT_CLAUDE_MODEL = "claude-opus-4-7-20260101";
-const TOOL_CAPABLE_ROUTES = new Set(["/v1/chat/completions", "/v1/responses"]);
+const DEFAULT_MODEL = "gateway-gpt-5";
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS",
+  "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
   "Access-Control-Allow-Headers": "authorization,content-type,x-api-key,anthropic-api-key,anthropic-version,anthropic-beta,openai-beta",
   "Access-Control-Expose-Headers": "content-type,request-id,x-request-id",
 };
@@ -16,532 +14,245 @@ export default {
       return new Response(null, { status: 204, headers: CORS_HEADERS });
     }
 
-    const url = new URL(request.url);
-    const path = normalizePath(url.pathname);
-
     try {
       const authError = validateWorkerApiKey(request, env);
       if (authError) return authError;
 
+      const url = new URL(request.url);
+      const path = normalizePath(url.pathname);
+
       if (path === "/" || path === "/health") {
-        return jsonResponse(serviceInfo(request, env));
+        return jsonResponse({
+          ok: true,
+          service: "unlimited.surf OpenAI-compatible Worker",
+          upstream: upstreamBase(env),
+          endpoints: ["/v1/models", "/v1/chat/completions", "/v1/responses", "/v1/messages", "/anthropic/v1/messages", "/api/*"],
+        });
       }
 
-      if (path.startsWith("/api/")) {
-        return proxyUpstream(request, env, path);
+      if (path.startsWith("/api/")) return proxyRawUpstream(request, env, path);
+
+      if (path === "/v1/setup" || path === "/setup" || path === "/anthropic/v1/setup") return textResponse(setupText(request));
+      if (path === "/v1/mcp" || path === "/mcp" || path === "/anthropic/v1/mcp") return jsonResponse(mcpInfo(request));
+      if (path === "/v1/codex" || path === "/codex" || path === "/anthropic/v1/codex") return textResponse(codexText(request));
+
+      if (isAnthropicMessagesPath(path) && request.method === "POST") return proxyAnthropic(request, env, "/v1/messages");
+      if (isAnthropicModelsPath(path) && request.method === "GET") return anthropicModels(request, env);
+
+      if (path === "/v1/models" && request.method === "GET") {
+        if (looksLikeAnthropicRequest(request)) return anthropicModels(request, env);
+        return openAIModels(request, env);
+      }
+      if (path === "/v1/chat/completions" && request.method === "POST") {
+        return openAIChatCompletions(request, env, await readJson(request));
+      }
+      if (path === "/v1/responses" && request.method === "POST") {
+        return openAIResponses(request, env, await readJson(request));
+      }
+      if ((path === "/v1/files/extract" || path === "/v1/attachments/extract") && request.method === "POST") {
+        return proxyJsonCapability(request, env, "/api/attachments/extract", await readJson(request));
+      }
+      if (path === "/v1/files" && request.method === "GET") {
+        return jsonResponse({ object: "list", data: [], has_more: false });
+      }
+      if (path === "/v1/embeddings" || path.startsWith("/v1/audio/") || path.startsWith("/v1/images/")) {
+        return errorResponse(501, "unsupported_endpoint", `${path} is not provided by unlimited.surf.`);
       }
 
-      if (path === "/mcp" || path === "/v1/mcp" || path === "/anthropic/mcp" || path === "/anthropic/v1/mcp") {
-        return jsonResponse(mcpInfo(request));
-      }
-
-      if (path === "/codex" || path === "/v1/codex" || path === "/anthropic/codex" || path === "/anthropic/v1/codex") {
-        return textResponse(codexSetup(request), "text/plain; charset=utf-8");
-      }
-
-      if (path === "/v1/setup" || path === "/anthropic/setup" || path === "/anthropic/v1/setup") {
-        return textResponse(agentSetup(request), "text/plain; charset=utf-8");
-      }
-
-      if (path === "/v1/messages" || (path === "/v1/models" && looksLikeAnthropicRequest(request)) || path.startsWith("/anthropic/")) {
-        return handleAnthropic(request, env, path);
-      }
-
-      if (path.startsWith("/v1/")) {
-        return handleOpenAI(request, env, path);
-      }
-
-      return errorResponse(404, "not_found", `No route for ${path}`);
+      return errorResponse(404, "not_found", `Unsupported route: ${path}`);
     } catch (error) {
       return errorResponse(500, "internal_error", error && error.message ? error.message : String(error));
     }
   },
 };
 
-async function handleOpenAI(request, env, path) {
-  if ((path === "/v1/key" || path === "/v1/auth-key" || path === "/v1/usage") && request.method === "GET") {
-    const rawPath = path === "/v1/usage" ? "/api/usage" : "/api/key";
-    return proxyUpstream(request, env, rawPath);
-  }
+async function openAIModels(request, env) {
+  const response = await fetch(new URL("/api/models", upstreamBase(env)), {
+    headers: upstreamHeaders(request, env, false),
+  });
 
-  if (path === "/v1/models" && request.method === "GET") {
-    if (looksLikeAnthropicRequest(request)) {
-      return anthropicModels(request, env);
-    }
-    return openAIModels(request, env);
-  }
+  if (!response.ok) return jsonResponse({ object: "list", data: fallbackModels() });
 
-  if (path === "/v1/search" && request.method === "POST") {
-    const body = await readJson(request);
-    return openAIDirectCapability(request, env, body, "/api/search");
-  }
-
-  if (path === "/v1/merge" && request.method === "POST") {
-    const body = await readJson(request);
-    return openAIDirectCapability(request, env, body, "/api/merge");
-  }
-
-  if (path === "/v1/chat/completions" && request.method === "POST") {
-    const body = await readJson(request);
-    const toolUpstream = maybeProxyToolCapableOpenAI(request, env, path, body);
-    if (toolUpstream) return toolUpstream;
-    return openAIChatCompletions(request, env, body);
-  }
-
-  if (path === "/v1/responses" && request.method === "POST") {
-    const body = await readJson(request);
-    const toolUpstream = maybeProxyToolCapableOpenAI(request, env, path, body);
-    if (toolUpstream) return toolUpstream;
-    return openAIResponses(request, env, body);
-  }
-
-  if (path === "/v1/files" && request.method === "GET") {
-    return jsonResponse({ object: "list", data: [], has_more: false });
-  }
-
-  if (path === "/v1/files" && request.method === "POST") {
-    return openAIFileUpload(request, env);
-  }
-
-  if ((path === "/v1/files/extract" || path === "/v1/attachments/extract") && request.method === "POST") {
-    const body = await readJson(request);
-    const extracted = await callUnlimitedJson(request, env, "/api/attachments/extract", body);
-    return jsonResponse(extracted);
-  }
-
-  if (path.startsWith("/v1/files/") && request.method === "GET") {
-    return errorResponse(404, "not_found", "This Worker is stateless. Bind KV/R2 if you need persisted OpenAI file retrieval.");
-  }
-
-  if (path === "/v1/embeddings" || path.startsWith("/v1/audio/") || path.startsWith("/v1/images/")) {
-    return errorResponse(501, "unsupported_endpoint", `${path} is not exposed by unlimited.surf and cannot be emulated faithfully.`);
-  }
-
-  return errorResponse(404, "not_found", `Unsupported OpenAI-compatible route ${path}`);
+  const raw = await response.json();
+  const models = Array.isArray(raw) ? raw : Array.isArray(raw.data) ? raw.data : [];
+  return jsonResponse({
+    object: "list",
+    data: models.map((model) => ({
+      id: model.id || model.name,
+      object: "model",
+      created: 0,
+      owned_by: model.provider || "unlimited.surf",
+    })).filter((model) => model.id),
+  });
 }
 
-function maybeProxyToolCapableOpenAI(request, env, path, body) {
-  if (!TOOL_CAPABLE_ROUTES.has(path) || !needsToolCapableUpstream(path, body)) return null;
+async function anthropicModels(request, env) {
+  const response = await fetch(new URL("/api/models", upstreamBase(env)), {
+    headers: upstreamHeaders(request, env, false),
+  });
 
-  const base = openAICompatBase(env);
-  if (!base) {
-    return errorResponse(
-      501,
-      "tool_calls_not_supported",
-      "This request needs structured tool calling, but unlimited.surf /api/chat only supports text chat through this Worker. Set OPENAI_COMPAT_BASE_URL and OPENAI_COMPAT_API_KEY to a real OpenAI-compatible tool-calling upstream."
-    );
-  }
-
-  return proxyOpenAICompat(request, env, path, body, base);
+  const raw = response.ok ? await response.json() : { data: fallbackModels() };
+  const models = Array.isArray(raw) ? raw : Array.isArray(raw.data) ? raw.data : [];
+  return jsonResponse({
+    data: models.filter((model) => model.id).map((model) => ({
+      id: toAnthropicModelId(model.id),
+      type: "model",
+      display_name: model.name || model.id,
+      created_at: "2026-01-01T00:00:00Z",
+    })),
+  });
 }
 
-function needsToolCapableUpstream(path, body) {
-  if (path === "/v1/responses") return true;
-  if (Array.isArray(body.tools) && body.tools.length) return true;
-  if (body.tool_choice && body.tool_choice !== "none") return true;
-  if (Array.isArray(body.messages)) {
-    return body.messages.some((message) => Array.isArray(message.tool_calls) || message.role === "tool" || message.function_call);
-  }
-  return false;
-}
-
-async function proxyOpenAICompat(request, env, path, body, base) {
-  const upstreamUrl = new URL(path, base);
+async function proxyAnthropic(request, env, upstreamPath) {
   const headers = new Headers();
-  headers.set("Content-Type", "application/json");
+  headers.set("Authorization", `Bearer ${upstreamApiKey(request, env)}`);
+  headers.set("x-api-key", upstreamApiKey(request, env));
+  headers.set("anthropic-api-key", upstreamApiKey(request, env));
+  headers.set("Content-Type", request.headers.get("content-type") || "application/json");
 
-  const key = env.OPENAI_COMPAT_API_KEY || env.TOOL_UPSTREAM_API_KEY || "";
-  if (key) headers.set("Authorization", `Bearer ${key}`);
+  for (const name of ["anthropic-version", "anthropic-beta", "accept"]) {
+    const value = request.headers.get(name);
+    if (value) headers.set(name, value);
+  }
 
-  const organization = request.headers.get("openai-organization");
-  if (organization) headers.set("OpenAI-Organization", organization);
-
-  const project = request.headers.get("openai-project");
-  if (project) headers.set("OpenAI-Project", project);
-
-  const beta = request.headers.get("openai-beta");
-  if (beta) headers.set("OpenAI-Beta", beta);
-
-  const response = await fetch(upstreamUrl, {
-    method: "POST",
+  const response = await fetch(new URL(upstreamPath, upstreamBase(env)), {
+    method: request.method,
     headers,
-    body: JSON.stringify(body),
+    body: request.body,
   });
 
   return addCors(new Response(response.body, {
     status: response.status,
     statusText: response.statusText,
-    headers: filterProxyResponseHeaders(response.headers),
+    headers: filterResponseHeaders(response.headers),
   }));
 }
 
-async function openAIDirectCapability(request, env, body, route) {
-  const model = body.model || env.DEFAULT_MODEL || DEFAULT_OPENAI_MODEL;
-  const created = nowSeconds();
-  const id = `chatcmpl_${randomId()}`;
-  const payload = buildUnlimitedPayload({ ...body, web_search: route === "/api/search", merge: route === "/api/merge" }, route);
-
-  if (body.stream !== false) {
-    const upstream = await callUnlimitedStream(request, env, route, payload);
-    return sseResponse(streamOpenAIChat(upstream, { id, created, model }));
-  }
-
-  const result = await collectUnlimitedText(request, env, route, payload);
-  return jsonResponse({
-    id,
-    object: "chat.completion",
-    created,
-    model,
-    choices: [
-      {
-        index: 0,
-        message: { role: "assistant", content: result.text },
-        logprobs: null,
-        finish_reason: result.finishReason || "stop",
-      },
-    ],
-    usage: usageFromText(payload.message || payload.query || "", result.text),
-    system_fingerprint: `unlimited-surf-worker:${route}`,
-  });
-}
-
 async function openAIChatCompletions(request, env, body) {
-  const model = body.model || env.DEFAULT_MODEL || DEFAULT_OPENAI_MODEL;
-  const created = nowSeconds();
+  const unsupported = unsupportedToolRequest(body);
+  if (unsupported) return unsupported;
+
+  const model = body.model || env.DEFAULT_MODEL || DEFAULT_MODEL;
   const id = `chatcmpl_${randomId()}`;
-  const route = chooseUnlimitedRoute(body);
-  const payload = buildUnlimitedPayload(body, route);
+  const created = nowSeconds();
+  const payload = {
+    message: body.message || messagesToText(body.messages) || inputToText(body.input) || body.prompt || "",
+    model,
+    effort: reasoningEffort(body),
+  };
 
   if (body.stream) {
-    const upstream = await callUnlimitedStream(request, env, route, payload);
+    const upstream = await callUnlimitedStream(request, env, "/api/chat", payload);
     return sseResponse(streamOpenAIChat(upstream, { id, created, model }));
   }
 
-  const result = await collectUnlimitedText(request, env, route, payload);
+  const result = await collectUnlimitedText(request, env, "/api/chat", payload);
   return jsonResponse({
     id,
     object: "chat.completion",
     created,
     model,
-    choices: [
-      {
-        index: 0,
-        message: { role: "assistant", content: result.text },
-        logprobs: null,
-        finish_reason: result.finishReason || "stop",
-      },
-    ],
-    usage: usageFromText(payload.message || "", result.text),
-    system_fingerprint: "unlimited-surf-worker",
+    choices: [{
+      index: 0,
+      message: { role: "assistant", content: result.text },
+      logprobs: null,
+      finish_reason: result.reason || "stop",
+    }],
+    usage: usageFromText(payload.message, result.text),
+    system_fingerprint: "unlimited-openai-worker",
   });
 }
 
 async function openAIResponses(request, env, body) {
-  const model = body.model || env.DEFAULT_MODEL || DEFAULT_OPENAI_MODEL;
-  const created = nowSeconds();
+  const unsupported = unsupportedToolRequest(body);
+  if (unsupported) return unsupported;
+
+  const model = body.model || env.DEFAULT_MODEL || DEFAULT_MODEL;
   const id = `resp_${randomId()}`;
-  const syntheticChatBody = responsesToChatBody(body, model);
-  const route = chooseUnlimitedRoute(syntheticChatBody);
-  const payload = buildUnlimitedPayload(syntheticChatBody, route);
+  const created = nowSeconds();
+  const input = inputToText(body.input) || messagesToText(body.messages) || body.prompt || "";
+  const payload = { message: input, model, effort: reasoningEffort(body) };
 
   if (body.stream) {
-    const upstream = await callUnlimitedStream(request, env, route, payload);
+    const upstream = await callUnlimitedStream(request, env, "/api/chat", payload);
     return sseResponse(streamOpenAIResponses(upstream, { id, created, model }));
   }
 
-  const result = await collectUnlimitedText(request, env, route, payload);
+  const result = await collectUnlimitedText(request, env, "/api/chat", payload);
   return jsonResponse({
     id,
     object: "response",
     created_at: created,
     status: "completed",
     error: null,
-    incomplete_details: null,
-    instructions: body.instructions || null,
-    max_output_tokens: body.max_output_tokens || body.max_tokens || null,
     model,
-    output: [
-      {
-        id: `msg_${randomId()}`,
-        type: "message",
-        status: "completed",
-        role: "assistant",
-        content: [{ type: "output_text", text: result.text, annotations: [] }],
-      },
-    ],
+    output: [{
+      id: `msg_${randomId()}`,
+      type: "message",
+      status: "completed",
+      role: "assistant",
+      content: [{ type: "output_text", text: result.text, annotations: [] }],
+    }],
     output_text: result.text,
-    parallel_tool_calls: true,
-    previous_response_id: body.previous_response_id || null,
-    reasoning: body.reasoning || null,
-    store: body.store || false,
-    temperature: body.temperature || null,
-    text: body.text || { format: { type: "text" } },
-    tool_choice: body.tool_choice || "auto",
-    tools: body.tools || [],
-    top_p: body.top_p || null,
-    truncation: body.truncation || "disabled",
-    usage: responseUsageFromText(payload.message || "", result.text),
-    user: body.user || null,
+    usage: responseUsageFromText(input, result.text),
   });
 }
 
-async function handleAnthropic(request, env, path) {
-  const anthPath = path.startsWith("/anthropic/") ? normalizePath(path.slice("/anthropic".length) || "/") : path;
-
-  if ((anthPath === "/v1/key" || anthPath === "/key" || anthPath === "/v1/auth-key" || anthPath === "/auth-key") && request.method === "GET") {
-    return proxyUpstream(request, env, "/api/key");
-  }
-
-  if ((anthPath === "/v1/usage" || anthPath === "/usage") && request.method === "GET") {
-    return proxyUpstream(request, env, "/api/usage");
-  }
-
-  if ((anthPath === "/v1/models" || anthPath === "/models") && request.method === "GET") {
-    return anthropicModels(request, env);
-  }
-
-  if ((anthPath === "/v1/messages" || anthPath === "/messages") && request.method === "POST") {
-    const body = await readJson(request);
-    return anthropicMessages(request, env, body);
-  }
-
-  if ((anthPath === "/v1/search" || anthPath === "/search") && request.method === "POST") {
-    const body = await readJson(request);
-    return anthropicDirectCapability(request, env, body, "/api/search");
-  }
-
-  if ((anthPath === "/v1/merge" || anthPath === "/merge") && request.method === "POST") {
-    const body = await readJson(request);
-    return anthropicDirectCapability(request, env, body, "/api/merge");
-  }
-
-  if (anthPath === "/v1/setup" || anthPath === "/setup") {
-    return textResponse(agentSetup(request), "text/plain; charset=utf-8");
-  }
-
-  return errorResponse(404, "not_found", `Unsupported Anthropic-compatible route ${path}`);
-}
-
-async function anthropicDirectCapability(request, env, body, route) {
-  const requestedModel = body.model || env.DEFAULT_CLAUDE_MODEL || DEFAULT_CLAUDE_MODEL;
-  const payload = buildAnthropicUnlimitedPayload({ ...body, web_search: route === "/api/search", merge: route === "/api/merge" }, route);
-  const id = `msg_${randomId()}`;
-
-  if (body.stream !== false) {
-    const upstream = await callUnlimitedStream(request, env, route, payload);
-    return sseResponse(streamAnthropicMessages(upstream, { id, model: requestedModel }));
-  }
-
-  const result = await collectUnlimitedText(request, env, route, payload);
-  return jsonResponse({
-    id,
-    type: "message",
-    role: "assistant",
-    model: requestedModel,
-    content: [{ type: "text", text: result.text }],
-    stop_reason: anthropicStopReason(result.finishReason),
-    stop_sequence: null,
-    usage: anthropicUsageFromText(payload.message || payload.query || "", result.text),
+function unsupportedToolRequest(body) {
+  const hasTools = Array.isArray(body.tools) && body.tools.length > 0;
+  const wantsToolChoice = body.tool_choice && body.tool_choice !== "none";
+  const hasToolMessages = Array.isArray(body.messages) && body.messages.some((message) => {
+    return message.role === "tool" || message.function_call || Array.isArray(message.tool_calls);
   });
+
+  if (!hasTools && !wantsToolChoice && !hasToolMessages) return null;
+
+  return errorResponse(
+    501,
+    "tool_calls_not_supported",
+    "unlimited.surf /api/chat streams text deltas and does not expose structured OpenAI tool_calls. Use this Worker for NewAPI chat, not agent command execution."
+  );
 }
 
-async function anthropicMessages(request, env, body) {
-  const requestedModel = body.model || env.DEFAULT_CLAUDE_MODEL || DEFAULT_CLAUDE_MODEL;
-  const route = chooseUnlimitedRoute(body);
-  const payload = buildAnthropicUnlimitedPayload(body, route);
-  const id = `msg_${randomId()}`;
-
-  if (body.stream) {
-    const upstream = await callUnlimitedStream(request, env, route, payload);
-    return sseResponse(streamAnthropicMessages(upstream, { id, model: requestedModel }));
-  }
-
-  const result = await collectUnlimitedText(request, env, route, payload);
-  return jsonResponse({
-    id,
-    type: "message",
-    role: "assistant",
-    model: requestedModel,
-    content: [{ type: "text", text: result.text }],
-    stop_reason: anthropicStopReason(result.finishReason),
-    stop_sequence: null,
-    usage: anthropicUsageFromText(payload.message || "", result.text),
-  });
-}
-
-async function openAIModels(request, env) {
-  const catalog = await getModelCatalog(request, env);
-  return jsonResponse({
-    object: "list",
-    data: catalog.map((model) => ({
-      id: model.id,
-      object: "model",
-      created: 0,
-      owned_by: model.provider || "unlimited.surf",
-      permission: [],
-      root: model.id,
-      parent: null,
-    })),
-  });
-}
-
-async function anthropicModels(request, env) {
-  const catalog = await getModelCatalog(request, env);
-  const claudeModels = catalog
-    .filter((model) => /claude|anthropic/i.test(`${model.id} ${model.name || ""} ${model.provider || ""}`))
-    .map((model) => toAnthropicModel(model));
-
-  return jsonResponse({
-    data: claudeModels.length ? claudeModels : [toAnthropicModel({ id: DEFAULT_CLAUDE_MODEL, name: "Claude Opus 4.7" })],
-    has_more: false,
-    first_id: claudeModels[0] ? claudeModels[0].id : DEFAULT_CLAUDE_MODEL,
-    last_id: claudeModels[claudeModels.length - 1] ? claudeModels[claudeModels.length - 1].id : DEFAULT_CLAUDE_MODEL,
-  });
-}
-
-async function openAIFileUpload(request, env) {
-  const contentType = request.headers.get("content-type") || "";
-  if (!contentType.includes("multipart/form-data")) {
-    return errorResponse(400, "invalid_request_error", "OpenAI file upload expects multipart/form-data with a file field.");
-  }
-
-  const form = await request.formData();
-  const file = form.get("file");
-  if (!file || typeof file === "string") {
-    return errorResponse(400, "invalid_request_error", "Missing multipart file field named file.");
-  }
-
-  const bytes = new Uint8Array(await file.arrayBuffer());
-  const payload = {
-    name: file.name || "upload.bin",
-    type: file.type || "application/octet-stream",
-    data: bytesToBase64(bytes),
-  };
-  const extracted = await callUnlimitedJson(request, env, "/api/attachments/extract", payload);
-  const id = `file_${randomId()}`;
-  return jsonResponse({
-    id,
-    object: "file",
-    bytes: bytes.byteLength,
-    created_at: nowSeconds(),
-    filename: payload.name,
-    purpose: form.get("purpose") || "assistants",
-    status: extracted && extracted.success === false ? "error" : "processed",
-    status_details: null,
-    unlimited_extract: extracted,
-  });
-}
-
-function chooseUnlimitedRoute(body) {
-  if (body.models && Array.isArray(body.models) && body.models.length >= 2) return "/api/merge";
-  if (body.merge || body.merge_ai) return "/api/merge";
-  if (body.query || body.web_search || body.web_search_options || hasWebSearchTool(body.tools)) return "/api/search";
-  return "/api/chat";
-}
-
-function buildUnlimitedPayload(body, route) {
-  if (route === "/api/search") {
-    return {
-      query: body.query || latestUserText(body.messages) || inputToText(body.input) || body.prompt || "",
-      model: mapUpstreamModel(body.model),
-      effort: body.effort || reasoningEffort(body),
-    };
-  }
-
-  const message = body.message || messagesToText(body.messages) || inputToText(body.input) || body.prompt || "";
-  const payload = {
-    message,
-    model: mapUpstreamModel(body.model),
-    effort: body.effort || reasoningEffort(body),
-  };
-
-  if (route === "/api/merge") {
-    payload.models = Array.isArray(body.models) && body.models.length ? body.models.map(mapUpstreamModel) : undefined;
-  }
-
-  return payload;
-}
-
-function buildAnthropicUnlimitedPayload(body, route) {
-  if (route === "/api/search") {
-    return {
-      query: latestUserText(body.messages) || body.query || "",
-      model: mapUpstreamModel(body.model),
-      effort: body.effort || reasoningEffort(body),
-    };
-  }
-
-  const prompt = anthropicMessagesToText(body);
-  const payload = {
-    message: prompt,
-    model: mapUpstreamModel(body.model),
-    effort: body.effort || reasoningEffort(body),
-  };
-
-  if (route === "/api/merge") {
-    payload.models = Array.isArray(body.models) && body.models.length ? body.models.map(mapUpstreamModel) : undefined;
-  }
-
-  return payload;
-}
-
-function responsesToChatBody(body, fallbackModel) {
-  const messages = [];
-  if (body.instructions) messages.push({ role: "system", content: body.instructions });
-  const inputText = inputToText(body.input);
-  if (inputText) messages.push({ role: "user", content: inputText });
-
-  return {
-    ...body,
-    model: body.model || fallbackModel,
-    messages,
-    stream: body.stream,
-  };
-}
-
-async function proxyUpstream(request, env, path) {
-  const upstreamUrl = new URL(path + new URL(request.url).search, upstreamBase(env));
-  const headers = new Headers(request.headers);
-  const key = optionalUpstreamApiKey(request, env);
-  if (key) headers.set("authorization", `Bearer ${key}`);
-  headers.delete("host");
-
-  const init = {
-    method: request.method,
-    headers,
-    body: request.method === "GET" || request.method === "HEAD" ? undefined : request.body,
-    redirect: "manual",
-  };
-
-  const response = await fetch(upstreamUrl, init);
-  return addCors(response);
-}
-
-async function callUnlimitedJson(request, env, path, payload) {
+async function proxyJsonCapability(request, env, path, body) {
   const response = await fetch(new URL(path, upstreamBase(env)), {
     method: "POST",
     headers: upstreamHeaders(request, env, false),
-    body: JSON.stringify(payload || {}),
+    body: JSON.stringify(body),
   });
+  return addCors(new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: filterResponseHeaders(response.headers),
+  }));
+}
 
-  if (!response.ok) {
-    throw new Error(`upstream ${path} failed: ${response.status} ${await response.text()}`);
-  }
+async function proxyRawUpstream(request, env, path) {
+  const url = new URL(request.url);
+  const upstreamUrl = new URL(path + url.search, upstreamBase(env));
+  const headers = new Headers(request.headers);
+  headers.set("Authorization", `Bearer ${upstreamApiKey(request, env)}`);
+  headers.delete("host");
 
-  return response.json();
+  const response = await fetch(upstreamUrl, {
+    method: request.method,
+    headers,
+    body: request.method === "GET" || request.method === "HEAD" ? undefined : request.body,
+  });
+  return addCors(new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: filterResponseHeaders(response.headers),
+  }));
 }
 
 async function callUnlimitedStream(request, env, path, payload) {
   const response = await fetch(new URL(path, upstreamBase(env)), {
     method: "POST",
     headers: upstreamHeaders(request, env, true),
-    body: JSON.stringify(payload || {}),
+    body: JSON.stringify(payload),
   });
-
-  if (!response.ok) {
-    throw new Error(`upstream ${path} failed: ${response.status} ${await response.text()}`);
-  }
-
+  if (!response.ok) throw new Error(`upstream ${path} failed: ${response.status} ${await response.text()}`);
   return response;
 }
 
@@ -549,36 +260,14 @@ async function collectUnlimitedText(request, env, path, payload) {
   const response = await callUnlimitedStream(request, env, path, payload);
   const events = await readUnlimitedEvents(response);
   let text = "";
-  let finishReason = "stop";
-  const annotations = [];
-
+  let reason = "stop";
   for (const event of events) {
     if (typeof event.delta === "string") text += event.delta;
-    if (event.results) annotations.push(event.results);
-    if (event.finish && event.reason) finishReason = event.reason;
+    if (event.text && typeof event.text === "string") text += event.text;
+    if (event.finish || event.done) reason = event.reason || reason;
+    if (event.error) throw new Error(typeof event.error === "string" ? event.error : JSON.stringify(event.error));
   }
-
-  return { text, finishReason, annotations, rawEvents: events };
-}
-
-async function getModelCatalog(request, env) {
-  try {
-    const headers = new Headers();
-    const key = optionalUpstreamApiKey(request, env);
-    if (key) headers.set("Authorization", `Bearer ${key}`);
-    const response = await fetch(new URL("/api/models", upstreamBase(env)), { headers });
-    if (!response.ok) throw new Error(`models failed: ${response.status}`);
-    const data = await response.json();
-    const models = Array.isArray(data) ? data : Array.isArray(data.data) ? data.data : [];
-    return models.map((model) => ({
-      id: model.id || model.name || String(model),
-      name: model.name || model.id || String(model),
-      provider: model.provider || providerFromModel(model.id || model.name || ""),
-      tier: model.tier || undefined,
-    })).filter((model) => model.id);
-  } catch (_) {
-    return fallbackModels();
-  }
+  return { text, reason };
 }
 
 function streamOpenAIChat(upstream, meta) {
@@ -616,18 +305,12 @@ function streamOpenAIChat(upstream, meta) {
 
 function streamOpenAIResponses(upstream, meta) {
   const outputId = `msg_${randomId()}`;
+  let fullText = "";
   return streamUnlimitedEvents(upstream, {
     start(controller) {
       writeSseEvent(controller, "response.created", {
         type: "response.created",
-        response: {
-          id: meta.id,
-          object: "response",
-          created_at: meta.created,
-          status: "in_progress",
-          model: meta.model,
-          output: [],
-        },
+        response: { id: meta.id, object: "response", created_at: meta.created, status: "in_progress", model: meta.model, output: [] },
       });
       writeSseEvent(controller, "response.output_item.added", {
         type: "response.output_item.added",
@@ -643,6 +326,7 @@ function streamOpenAIResponses(upstream, meta) {
       });
     },
     delta(controller, text) {
+      fullText += text;
       writeSseEvent(controller, "response.output_text.delta", {
         type: "response.output_text.delta",
         item_id: outputId,
@@ -657,19 +341,19 @@ function streamOpenAIResponses(upstream, meta) {
         item_id: outputId,
         output_index: 0,
         content_index: 0,
-        text: "",
+        text: fullText,
       });
       writeSseEvent(controller, "response.content_part.done", {
         type: "response.content_part.done",
         item_id: outputId,
         output_index: 0,
         content_index: 0,
-        part: { type: "output_text", text: "", annotations: [] },
+        part: { type: "output_text", text: fullText, annotations: [] },
       });
       writeSseEvent(controller, "response.output_item.done", {
         type: "response.output_item.done",
         output_index: 0,
-        item: { id: outputId, type: "message", status: "completed", role: "assistant", content: [] },
+        item: { id: outputId, type: "message", status: "completed", role: "assistant", content: [{ type: "output_text", text: fullText, annotations: [] }] },
       });
       writeSseEvent(controller, "response.completed", {
         type: "response.completed",
@@ -680,86 +364,37 @@ function streamOpenAIResponses(upstream, meta) {
   });
 }
 
-function streamAnthropicMessages(upstream, meta) {
-  return streamUnlimitedEvents(upstream, {
-    start(controller) {
-      writeSseEvent(controller, "message_start", {
-        type: "message_start",
-        message: {
-          id: meta.id,
-          type: "message",
-          role: "assistant",
-          model: meta.model,
-          content: [],
-          stop_reason: null,
-          stop_sequence: null,
-          usage: { input_tokens: 0, output_tokens: 0 },
-        },
-      });
-      writeSseEvent(controller, "content_block_start", {
-        type: "content_block_start",
-        index: 0,
-        content_block: { type: "text", text: "" },
-      });
-    },
-    delta(controller, text) {
-      writeSseEvent(controller, "content_block_delta", {
-        type: "content_block_delta",
-        index: 0,
-        delta: { type: "text_delta", text },
-      });
-    },
-    finish(controller, reason) {
-      writeSseEvent(controller, "content_block_stop", { type: "content_block_stop", index: 0 });
-      writeSseEvent(controller, "message_delta", {
-        type: "message_delta",
-        delta: { stop_reason: anthropicStopReason(reason), stop_sequence: null },
-        usage: { output_tokens: 0 },
-      });
-      writeSseEvent(controller, "message_stop", { type: "message_stop" });
-    },
-  });
-}
-
 function streamUnlimitedEvents(upstream, handlers) {
   const encoder = new TextEncoder();
   const decoder = new TextDecoder();
-
   return new ReadableStream({
     async start(controller) {
       let finished = false;
-      handlers.start && handlers.start(controller);
-
+      let buffer = "";
       try {
+        if (handlers.start) handlers.start(controller);
         const reader = upstream.body.getReader();
-        let buffer = "";
-
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
           buffer += decoder.decode(value, { stream: true });
           const lines = buffer.split(/\r?\n/);
           buffer = lines.pop() || "";
-
           for (const line of lines) {
-            if (!line.startsWith("data:")) continue;
-            const parsed = parseSseJson(line.slice(5).trim());
-            if (!parsed) continue;
-
-            if (typeof parsed.delta === "string" && parsed.delta.length) {
-              handlers.delta && handlers.delta(controller, parsed.delta, parsed);
-            }
-
-            if (parsed.finish || parsed.done) {
+            const event = parseDataLine(line);
+            if (!event) continue;
+            if (event.error) throw new Error(typeof event.error === "string" ? event.error : JSON.stringify(event.error));
+            if (typeof event.delta === "string" && handlers.delta) handlers.delta(controller, event.delta, event);
+            if (typeof event.text === "string" && handlers.delta) handlers.delta(controller, event.text, event);
+            if (event.finish || event.done) {
               finished = true;
-              handlers.finish && handlers.finish(controller, parsed.reason || "stop", parsed);
+              if (handlers.finish) handlers.finish(controller, event.reason || "stop", event);
             }
           }
         }
-
-        if (!finished) handlers.finish && handlers.finish(controller, "stop", {});
+        if (!finished && handlers.finish) handlers.finish(controller, "stop", {});
       } catch (error) {
-        controller.enqueue(encoder.encode(`event: error\ndata: ${JSON.stringify({ error: error.message || String(error) })}\n\n`));
+        controller.enqueue(encoder.encode(`event: error\ndata: ${JSON.stringify({ error: { message: error.message || String(error) } })}\n\n`));
       } finally {
         controller.close();
       }
@@ -772,7 +407,6 @@ async function readUnlimitedEvents(response) {
   const reader = response.body.getReader();
   const events = [];
   let buffer = "";
-
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
@@ -780,76 +414,122 @@ async function readUnlimitedEvents(response) {
     const lines = buffer.split(/\r?\n/);
     buffer = lines.pop() || "";
     for (const line of lines) {
-      if (!line.startsWith("data:")) continue;
-      const parsed = parseSseJson(line.slice(5).trim());
-      if (parsed) events.push(parsed);
+      const event = parseDataLine(line);
+      if (event) events.push(event);
     }
   }
-
-  if (buffer.startsWith("data:")) {
-    const parsed = parseSseJson(buffer.slice(5).trim());
-    if (parsed) events.push(parsed);
-  }
-
+  const event = parseDataLine(buffer);
+  if (event) events.push(event);
   return events;
 }
 
-function writeSse(controller, data) {
-  writeRawSse(controller, `data: ${JSON.stringify(data)}\n\n`);
+function parseDataLine(line) {
+  const trimmed = String(line || "").trim();
+  if (!trimmed.startsWith("data:")) return null;
+  const data = trimmed.slice(5).trim();
+  if (!data || data === "[DONE]") return null;
+  try {
+    return JSON.parse(data);
+  } catch (_) {
+    return null;
+  }
 }
 
-function writeSseEvent(controller, event, data) {
-  writeRawSse(controller, `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+function messagesToText(messages) {
+  if (!Array.isArray(messages)) return "";
+  return messages.map((message) => {
+    const role = message.role || "user";
+    return `${role}: ${contentToText(message.content)}`;
+  }).filter(Boolean).join("\n\n");
 }
 
-function writeRawSse(controller, chunk) {
-  controller.enqueue(new TextEncoder().encode(chunk));
+function inputToText(input) {
+  if (!input) return "";
+  if (typeof input === "string") return input;
+  if (!Array.isArray(input)) return contentToText(input);
+  return input.map((item) => {
+    if (typeof item === "string") return item;
+    if (item.type === "message") return `${item.role || "user"}: ${contentToText(item.content)}`;
+    if (item.role) return `${item.role}: ${contentToText(item.content)}`;
+    if (item.type === "input_text" || item.type === "output_text") return item.text || "";
+    return contentToText(item);
+  }).filter(Boolean).join("\n\n");
 }
 
-function sseResponse(body) {
-  return new Response(body, {
-    headers: {
-      ...CORS_HEADERS,
-      "Content-Type": "text/event-stream; charset=utf-8",
-      "Cache-Control": "no-cache, no-transform",
-      "Connection": "keep-alive",
-      "X-Accel-Buffering": "no",
-    },
-  });
+function contentToText(content) {
+  if (content == null) return "";
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) return content.map(contentToText).filter(Boolean).join("\n");
+  if (typeof content === "object") {
+    if (typeof content.text === "string") return content.text;
+    if (content.type === "text" && typeof content.text === "string") return content.text;
+    if (content.type === "input_text" && typeof content.text === "string") return content.text;
+    if (content.type === "image_url") return "[image]";
+    if (content.type === "tool_result") return `[tool_result] ${contentToText(content.content)}`;
+    if (content.type) return `[${content.type}] ${JSON.stringify(content)}`;
+  }
+  return String(content);
+}
+
+function upstreamHeaders(request, env, wantsStream) {
+  const headers = new Headers();
+  headers.set("Authorization", `Bearer ${upstreamApiKey(request, env)}`);
+  headers.set("Content-Type", "application/json");
+  if (wantsStream) headers.set("Accept", "text/event-stream");
+  return headers;
+}
+
+function upstreamApiKey(request, env) {
+  const key = env.UNLIMITED_SURF_API_KEY || clientApiKey(request);
+  if (key) return key;
+  throw new Error("Missing upstream API key. Set UNLIMITED_SURF_API_KEY or pass Authorization: Bearer <key>.");
+}
+
+function validateWorkerApiKey(request, env) {
+  if (!env.WORKER_API_KEY) return null;
+  const key = clientApiKey(request);
+  if (key && constantTimeEqual(key, env.WORKER_API_KEY)) return null;
+  return errorResponse(401, "unauthorized", "Invalid or missing API key.");
+}
+
+function clientApiKey(request) {
+  const auth = request.headers.get("authorization") || "";
+  const match = auth.match(/^Bearer\s+(.+)$/i);
+  if (match) return match[1].trim();
+  return (request.headers.get("x-api-key") || request.headers.get("anthropic-api-key") || "").trim();
+}
+
+function constantTimeEqual(actual, expected) {
+  const a = String(actual || "");
+  const b = String(expected || "");
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i += 1) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
 }
 
 function jsonResponse(data, init = {}) {
   return new Response(JSON.stringify(data, null, 2), {
     ...init,
-    headers: {
-      ...CORS_HEADERS,
-      "Content-Type": "application/json; charset=utf-8",
-      "Cache-Control": "no-store",
-      ...(init.headers || {}),
-    },
+    headers: { ...CORS_HEADERS, "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store", ...(init.headers || {}) },
   });
 }
 
-function textResponse(text, contentType, init = {}) {
+function textResponse(text, init = {}) {
   return new Response(text, {
     ...init,
-    headers: {
-      ...CORS_HEADERS,
-      "Content-Type": contentType,
-      "Cache-Control": "no-store",
-      ...(init.headers || {}),
-    },
+    headers: { ...CORS_HEADERS, "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store", ...(init.headers || {}) },
   });
 }
 
 function errorResponse(status, code, message) {
-  return jsonResponse({
-    error: {
-      message,
-      type: code,
-      code,
-    },
-  }, { status });
+  return jsonResponse({ error: { message, type: code, code } }, { status });
+}
+
+function sseResponse(body) {
+  return new Response(body, {
+    headers: { ...CORS_HEADERS, "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache, no-transform", "Connection": "keep-alive" },
+  });
 }
 
 function addCors(response) {
@@ -858,7 +538,7 @@ function addCors(response) {
   return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
 }
 
-function filterProxyResponseHeaders(source) {
+function filterResponseHeaders(source) {
   const headers = new Headers();
   for (const name of ["content-type", "cache-control", "request-id", "x-request-id"]) {
     const value = source.get(name);
@@ -878,77 +558,134 @@ async function readJson(request) {
   }
 }
 
-function upstreamHeaders(request, env, wantsStream) {
-  const headers = new Headers();
-  headers.set("Authorization", `Bearer ${upstreamApiKey(request, env)}`);
-  headers.set("Content-Type", "application/json");
-  if (wantsStream) headers.set("Accept", "text/event-stream");
-  return headers;
+function writeSse(controller, data) {
+  writeRawSse(controller, `data: ${JSON.stringify(data)}\n\n`);
 }
 
-function upstreamApiKey(request, env) {
-  const key = optionalUpstreamApiKey(request, env);
-  if (key) return key;
-
-  if (env.WORKER_API_KEY) {
-    throw new Error("Missing upstream API key. Set UNLIMITED_SURF_API_KEY when WORKER_API_KEY is enabled.");
-  }
-
-  throw new Error("Missing upstream API key. Set UNLIMITED_SURF_API_KEY or pass Authorization: Bearer <key> / x-api-key: <key>.");
+function writeSseEvent(controller, event, data) {
+  writeRawSse(controller, `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 }
 
-function optionalUpstreamApiKey(request, env) {
-  const configured = env.UNLIMITED_SURF_API_KEY || env.API_KEY || env.AUTH_KEY;
-  if (configured) return configured;
-
-  if (env.WORKER_API_KEY) return "";
-
-  return clientApiKey(request);
+function writeRawSse(controller, chunk) {
+  controller.enqueue(new TextEncoder().encode(chunk));
 }
 
-function validateWorkerApiKey(request, env) {
-  const expected = env.WORKER_API_KEY;
-  if (!expected) return null;
+function reasoningEffort(body) {
+  const effort = body.effort || (body.reasoning && body.reasoning.effort);
+  if (["low", "medium", "high"].includes(effort)) return effort;
+  return "medium";
+}
 
-  const actual = clientApiKey(request);
-  if (actual && constantTimeEqual(actual, expected)) return null;
+function usageFromText(input, output) {
+  return {
+    prompt_tokens: estimateTokens(input),
+    completion_tokens: estimateTokens(output),
+    total_tokens: estimateTokens(input) + estimateTokens(output),
+  };
+}
 
-  return jsonResponse({
-    error: {
-      message: "Invalid or missing Worker API key.",
-      type: "authentication_error",
-      code: "invalid_api_key",
+function responseUsageFromText(input, output) {
+  return {
+    input_tokens: estimateTokens(input),
+    output_tokens: estimateTokens(output),
+    total_tokens: estimateTokens(input) + estimateTokens(output),
+  };
+}
+
+function estimateTokens(text) {
+  return Math.max(1, Math.ceil(String(text || "").length / 4));
+}
+
+function openAIStopReason(reason) {
+  if (!reason || reason === "done") return "stop";
+  if (reason === "length" || reason === "stop" || reason === "content_filter") return reason;
+  return "stop";
+}
+
+function fallbackModels() {
+  return [
+    { id: "gateway-gpt-5", object: "model", created: 0, owned_by: "openai" },
+    { id: "gateway-gpt-5-5", object: "model", created: 0, owned_by: "openai" },
+    { id: "gateway-claude-opus-4-7", object: "model", created: 0, owned_by: "anthropic" },
+    { id: "gateway-google-2.5-pro", object: "model", created: 0, owned_by: "google" },
+  ];
+}
+
+function isAnthropicMessagesPath(path) {
+  return path === "/v1/messages" || path === "/anthropic/v1/messages" || path === "/anthropic/messages";
+}
+
+function isAnthropicModelsPath(path) {
+  return path === "/anthropic/v1/models" || path === "/anthropic/models";
+}
+
+function looksLikeAnthropicRequest(request) {
+  return request.headers.has("anthropic-version") || request.headers.has("anthropic-beta") || request.headers.has("anthropic-api-key");
+}
+
+function toAnthropicModelId(id) {
+  const value = String(id || "");
+  if (/^claude-.*-\d{8}$/.test(value)) return value;
+  if (value.startsWith("gateway-claude-opus-4-8")) return "claude-opus-4-8-20260601";
+  if (value.startsWith("gateway-claude-opus-4-7")) return "claude-opus-4-7-20260101";
+  if (value.startsWith("gateway-claude-opus-4-6")) return "claude-opus-4-6-20260101";
+  if (value.startsWith("gateway-claude-opus-4-5")) return "claude-opus-4-5-20260101";
+  if (value.startsWith("gateway-claude-opus-4-1")) return "claude-opus-4-1-20250805";
+  if (value.startsWith("gateway-claude-sonnet-4-6")) return "claude-sonnet-4-6-20260101";
+  if (value.startsWith("gateway-claude-sonnet-4")) return "claude-sonnet-4-20250514";
+  return value;
+}
+
+function setupText(request) {
+  const origin = new URL(request.url).origin;
+  return `unlimited.surf Worker setup
+
+OpenAI/NewAPI:
+  Base URL: ${origin}/v1
+  API key: WORKER_API_KEY
+  Model: gateway-gpt-5
+
+Hermes / Claude Code / Anthropic-compatible agents:
+  ANTHROPIC_BASE_URL=${origin}
+  ANTHROPIC_AUTH_TOKEN=WORKER_API_KEY
+  ANTHROPIC_API_KEY=WORKER_API_KEY
+  ANTHROPIC_MODEL=claude-opus-4-7-20260101
+
+MCP/tools execute in the local client or agent. This Worker only preserves and forwards Anthropic-compatible /v1/messages requests to unlimited.surf.`;
+}
+
+function codexText(request) {
+  const origin = new URL(request.url).origin;
+  return `Codex notes
+
+OpenAI chat-compatible endpoint:
+  ${origin}/v1/chat/completions
+
+Text-only Responses compatibility:
+  ${origin}/v1/responses
+
+Anthropic-compatible endpoint for agents that support it:
+  ${origin}/v1/messages
+
+Native OpenAI structured tool_calls are not created by unlimited.surf /api/chat. Use the Anthropic-compatible route when your agent supports it.`;
+}
+
+function mcpInfo(request) {
+  const origin = new URL(request.url).origin;
+  return {
+    supported: true,
+    note: "MCP servers and shell tools run in the local agent, not inside Cloudflare Worker.",
+    endpoints: {
+      openai_chat_completions: `${origin}/v1/chat/completions`,
+      openai_responses_text_only: `${origin}/v1/responses`,
+      anthropic_messages: `${origin}/v1/messages`,
+      anthropic_messages_alias: `${origin}/anthropic/v1/messages`,
     },
-  }, { status: 401, headers: { "WWW-Authenticate": "Bearer" } });
-}
-
-function clientApiKey(request) {
-  const auth = request.headers.get("authorization") || "";
-  if (/^bearer\s+/i.test(auth)) return auth.replace(/^bearer\s+/i, "").trim();
-
-  const xKey = request.headers.get("x-api-key") || request.headers.get("anthropic-api-key");
-  return xKey ? xKey.trim() : "";
-}
-
-function constantTimeEqual(actual, expected) {
-  const actualText = String(actual || "");
-  const expectedText = String(expected || "");
-  if (actualText.length !== expectedText.length) return false;
-
-  let diff = 0;
-  for (let i = 0; i < actualText.length; i += 1) {
-    diff |= actualText.charCodeAt(i) ^ expectedText.charCodeAt(i);
-  }
-  return diff === 0;
+  };
 }
 
 function upstreamBase(env) {
   return stripTrailingSlash(env.UPSTREAM_BASE_URL || DEFAULT_UPSTREAM_BASE_URL) + "/";
-}
-
-function openAICompatBase(env) {
-  const value = env.OPENAI_COMPAT_BASE_URL || env.TOOL_UPSTREAM_BASE_URL || "";
-  return value ? stripTrailingSlash(value) + "/" : "";
 }
 
 function normalizePath(path) {
@@ -957,166 +694,8 @@ function normalizePath(path) {
   return normalized.length > 1 ? normalized.replace(/\/+$/, "") : normalized;
 }
 
-function messagesToText(messages) {
-  if (!Array.isArray(messages)) return "";
-  return messages.map((message) => {
-    const role = message.role || "user";
-    return `${role}: ${contentToText(message.content)}`;
-  }).filter(Boolean).join("\n\n");
-}
-
-function anthropicMessagesToText(body) {
-  const parts = [];
-  if (body.system) parts.push(`system: ${contentToText(body.system)}`);
-  if (Array.isArray(body.tools) && body.tools.length) {
-    parts.push(`available tools: ${JSON.stringify(body.tools)}`);
-    parts.push("If a tool is required, describe the intended tool call clearly. MCP and local tools must be executed by the client agent.");
-  }
-  if (Array.isArray(body.messages)) parts.push(messagesToText(body.messages));
-  return parts.filter(Boolean).join("\n\n");
-}
-
-function inputToText(input) {
-  if (!input) return "";
-  if (typeof input === "string") return input;
-  if (!Array.isArray(input)) return contentToText(input);
-
-  return input.map((item) => {
-    if (typeof item === "string") return item;
-    if (item.type === "message") return `${item.role || "user"}: ${contentToText(item.content)}`;
-    if (item.role) return `${item.role}: ${contentToText(item.content)}`;
-    if (item.type === "input_text" || item.type === "output_text") return item.text || "";
-    return contentToText(item);
-  }).filter(Boolean).join("\n\n");
-}
-
-function contentToText(content) {
-  if (content == null) return "";
-  if (typeof content === "string") return content;
-  if (Array.isArray(content)) {
-    return content.map((part) => contentToText(part)).filter(Boolean).join("\n");
-  }
-  if (typeof content === "object") {
-    if (typeof content.text === "string") return content.text;
-    if (typeof content.input_text === "string") return content.input_text;
-    if (content.type === "text" && typeof content.text === "string") return content.text;
-    if (content.type === "input_text" && typeof content.text === "string") return content.text;
-    if (content.type === "image_url") return `[image: ${content.image_url && content.image_url.url ? content.image_url.url : "attached"}]`;
-    if (content.type === "image") return "[image attached]";
-    if (content.type === "tool_result") return `[tool_result ${content.tool_use_id || ""}] ${contentToText(content.content)}`;
-    if (content.type === "tool_use") return `[tool_use ${content.name || "tool"}] ${JSON.stringify(content.input || {})}`;
-    if (content.type) return `[${content.type}] ${JSON.stringify(content)}`;
-  }
-  return String(content);
-}
-
-function latestUserText(messages) {
-  if (!Array.isArray(messages)) return "";
-  for (let i = messages.length - 1; i >= 0; i -= 1) {
-    if ((messages[i].role || "user") === "user") return contentToText(messages[i].content);
-  }
-  return "";
-}
-
-function hasWebSearchTool(tools) {
-  if (!Array.isArray(tools)) return false;
-  return tools.some((tool) => {
-    const type = tool && (tool.type || tool.name || (tool.function && tool.function.name));
-    return /web.?search|browser|search/i.test(String(type || ""));
-  });
-}
-
-function reasoningEffort(body) {
-  if (body.effort) return body.effort;
-  if (typeof body.reasoning_effort === "string") return body.reasoning_effort;
-  if (body.reasoning && typeof body.reasoning.effort === "string") return body.reasoning.effort;
-  return "medium";
-}
-
-function mapUpstreamModel(model) {
-  if (!model) return DEFAULT_OPENAI_MODEL;
-  if (model.startsWith("gateway-")) return model;
-  if (/^claude-/i.test(model)) return `gateway-${model.replace(/-\d{8}$/, "")}`;
-  if (/^gpt-/i.test(model)) return `gateway-${model}`;
-  if (/^gemini-/i.test(model)) return `gateway-google-${model.replace(/^gemini-/i, "")}`;
-  return model;
-}
-
-function toAnthropicModel(model) {
-  const id = model.id.startsWith("gateway-") ? model.id.replace(/^gateway-/, "") : model.id;
-  const versioned = /^claude-.*-\d{8}$/.test(id) ? id : anthropicVersionedId(id);
-  return {
-    id: versioned,
-    type: "model",
-    display_name: model.name || versioned,
-    created_at: "2026-01-01T00:00:00Z",
-  };
-}
-
-function anthropicVersionedId(id) {
-  if (/^claude-/i.test(id)) return `${id}-20260101`;
-  return id;
-}
-
-function providerFromModel(model) {
-  if (/claude|anthropic/i.test(model)) return "anthropic";
-  if (/gemini|google/i.test(model)) return "google";
-  if (/gpt|openai/i.test(model)) return "openai";
-  return "unlimited.surf";
-}
-
-function fallbackModels() {
-  return [
-    { id: "gateway-gpt-5", name: "GPT-5", provider: "openai", tier: "flagship" },
-    { id: "gateway-gpt-5-1", name: "GPT-5.1", provider: "openai", tier: "flagship" },
-    { id: "gateway-claude-opus-4-7", name: "Claude Opus 4.7", provider: "anthropic", tier: "flagship" },
-    { id: "gateway-google-2.5-pro", name: "Gemini 2.5 Pro", provider: "google", tier: "flagship" },
-    { id: "gateway-gemini-3-flash", name: "Gemini 3 Flash", provider: "google", tier: "fast" },
-  ];
-}
-
-function parseSseJson(data) {
-  if (!data || data === "[DONE]") return null;
-  try {
-    return JSON.parse(data);
-  } catch (_) {
-    return null;
-  }
-}
-
-function openAIStopReason(reason) {
-  if (!reason) return "stop";
-  if (reason === "max_tokens") return "length";
-  if (reason === "tool_use") return "tool_calls";
-  return reason === "end_turn" ? "stop" : reason;
-}
-
-function anthropicStopReason(reason) {
-  if (!reason || reason === "stop") return "end_turn";
-  if (reason === "length") return "max_tokens";
-  if (reason === "tool_calls") return "tool_use";
-  return reason;
-}
-
-function usageFromText(input, output) {
-  const promptTokens = estimateTokens(input);
-  const completionTokens = estimateTokens(output);
-  return { prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: promptTokens + completionTokens };
-}
-
-function responseUsageFromText(input, output) {
-  const inputTokens = estimateTokens(input);
-  const outputTokens = estimateTokens(output);
-  return { input_tokens: inputTokens, output_tokens: outputTokens, total_tokens: inputTokens + outputTokens };
-}
-
-function anthropicUsageFromText(input, output) {
-  return { input_tokens: estimateTokens(input), output_tokens: estimateTokens(output) };
-}
-
-function estimateTokens(text) {
-  if (!text) return 0;
-  return Math.max(1, Math.ceil(String(text).length / 4));
+function stripTrailingSlash(value) {
+  return String(value || "").replace(/\/+$/, "");
 }
 
 function nowSeconds() {
@@ -1127,107 +706,4 @@ function randomId() {
   const bytes = new Uint8Array(12);
   crypto.getRandomValues(bytes);
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
-}
-
-function stripTrailingSlash(value) {
-  return String(value || "").replace(/\/+$/, "");
-}
-
-function bytesToBase64(bytes) {
-  let binary = "";
-  const chunkSize = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
-  }
-  return btoa(binary);
-}
-
-function looksLikeAnthropicRequest(request) {
-  return request.headers.has("anthropic-version") || request.headers.has("anthropic-beta") || request.headers.has("x-api-key");
-}
-
-function serviceInfo(request, env) {
-  const origin = new URL(request.url).origin;
-  return {
-    ok: true,
-    service: "unlimited.surf OpenAI/Anthropic compatibility Worker",
-    upstream: stripTrailingSlash(env.UPSTREAM_BASE_URL || DEFAULT_UPSTREAM_BASE_URL),
-    routes: {
-      raw: `${origin}/api/chat, /api/search, /api/merge, /api/models, /api/key, /api/attachments/extract`,
-      openai: `${origin}/v1/chat/completions, /v1/responses, /v1/models, /v1/files`,
-      anthropic: `${origin}/v1/messages or ${origin}/anthropic/v1/messages`,
-      setup: `${origin}/v1/setup, /v1/codex, /v1/mcp`,
-    },
-  };
-}
-
-function agentSetup(request) {
-  const origin = new URL(request.url).origin;
-  return `Claude Code / Anthropic-compatible setup
-
-PowerShell:
-$env:ANTHROPIC_BASE_URL = "${origin}"
-$env:ANTHROPIC_AUTH_TOKEN = "<your unlimited.surf key>"
-$env:ANTHROPIC_API_KEY = "<your unlimited.surf key>"
-$env:ANTHROPIC_MODEL = "${DEFAULT_CLAUDE_MODEL}"
-claude
-
-Bash:
-export ANTHROPIC_BASE_URL="${origin}"
-export ANTHROPIC_AUTH_TOKEN="<your unlimited.surf key>"
-export ANTHROPIC_API_KEY="<your unlimited.surf key>"
-export ANTHROPIC_MODEL="${DEFAULT_CLAUDE_MODEL}"
-claude
-
-Goose / Hermes / other agents:
-Provider: Anthropic-compatible
-Base URL: ${origin}
-API key: <your unlimited.surf key>
-Model: ${DEFAULT_CLAUDE_MODEL}
-
-Messages endpoint: POST ${origin}/v1/messages
-Models endpoint: GET ${origin}/v1/models
-
-MCP tools run in the client/agent environment. Use this Worker as the model endpoint, then configure MCP servers in your IDE or agent.
-`;
-}
-
-function codexSetup(request) {
-  const origin = new URL(request.url).origin;
-  return `Codex custom provider notes
-
-OpenAI-compatible Chat Completions:
-base_url = "${origin}/v1"
-api_key = "<your unlimited.surf key>"
-model = "${DEFAULT_OPENAI_MODEL}"
-
-OpenAI Responses-compatible route for newer agents:
-POST ${origin}/v1/responses
-
-Direct smoke test:
-curl ${origin}/v1/chat/completions \\
-  -H "Authorization: Bearer <your unlimited.surf key>" \\
-  -H "Content-Type: application/json" \\
-  -d '{"model":"${DEFAULT_OPENAI_MODEL}","messages":[{"role":"user","content":"Write a small test function."}],"stream":true}'
-
-Anthropic-compatible agent route:
-POST ${origin}/v1/messages
-
-MCP execution remains client-side; configure MCP servers in Codex or your IDE, and point the model provider at this Worker.
-`;
-}
-
-function mcpInfo(request) {
-  const origin = new URL(request.url).origin;
-  return {
-    supported: true,
-    model_endpoint: origin,
-    note: "MCP servers execute inside the client or agent. This Worker supplies OpenAI/Anthropic-compatible model endpoints and does not run local MCP tools in the browser or edge runtime.",
-    endpoints: {
-      openai_responses: `${origin}/v1/responses`,
-      openai_chat_completions: `${origin}/v1/chat/completions`,
-      anthropic_messages: `${origin}/v1/messages`,
-      setup: `${origin}/v1/setup`,
-    },
-  };
 }
